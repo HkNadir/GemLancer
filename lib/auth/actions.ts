@@ -69,14 +69,18 @@ export interface AuthActionResult {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-function getRequestContext() {
-  const headersList = headers()
-  const ip =
-    headersList.get('x-forwarded-for')?.split(',')[0]?.trim() ??
-    headersList.get('x-real-ip') ??
-    'unknown'
-  const userAgent = headersList.get('user-agent') ?? 'unknown'
-  return { ip, userAgent }
+async function getRequestContext() {
+  try {
+    const headersList = await headers()
+    const ip =
+      headersList.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+      headersList.get('x-real-ip') ??
+      'unknown'
+    const userAgent = headersList.get('user-agent') ?? 'unknown'
+    return { ip, userAgent }
+  } catch {
+    return { ip: 'unknown', userAgent: 'unknown' }
+  }
 }
 
 function generateSlug(name: string): string {
@@ -95,67 +99,73 @@ export async function signInAction(
   _prevState: AuthActionResult,
   formData: FormData
 ): Promise<AuthActionResult> {
-  const { ip, userAgent } = getRequestContext()
+  try {
+    const { ip, userAgent } = await getRequestContext()
 
-  const raw = {
-    email: formData.get('email') as string,
-    password: formData.get('password') as string,
-    rememberMe: formData.get('rememberMe') === 'on',
-  }
-
-  // Client-mirrored schema validation (server-side authoritative)
-  const parsed = signInSchema.safeParse(raw)
-  if (!parsed.success) {
-    const firstError = parsed.error.errors[0]
-    return { error: firstError.message, field: String(firstError.path[0]) }
-  }
-
-  const { email, password } = parsed.data
-
-  // ── Rate limit check (before touching auth) ─────────────────
-  const rateLimit = await checkRateLimit(email, ip)
-  if (!rateLimit.allowed) {
-    return {
-      error: `Too many failed login attempts. Please try again in ${rateLimit.retryAfterMinutes} minute${rateLimit.retryAfterMinutes === 1 ? '' : 's'}.`,
-      rateLimited: true,
-      retryAfterMinutes: rateLimit.retryAfterMinutes,
+    const raw = {
+      email: formData.get('email') as string,
+      password: formData.get('password') as string,
+      rememberMe: formData.get('rememberMe') === 'on',
     }
+
+    // Client-mirrored schema validation (server-side authoritative)
+    const parsed = signInSchema.safeParse(raw)
+    if (!parsed.success) {
+      const firstError = parsed.error.errors[0]
+      return { error: firstError.message, field: String(firstError.path[0]) }
+    }
+
+    const { email, password } = parsed.data
+
+    // ── Rate limit check (before touching auth) ─────────────────
+    const rateLimit = await checkRateLimit(email, ip)
+    if (!rateLimit.allowed) {
+      return {
+        error: `Too many failed login attempts. Please try again in ${rateLimit.retryAfterMinutes} minute${rateLimit.retryAfterMinutes === 1 ? '' : 's'}.`,
+        rateLimited: true,
+        retryAfterMinutes: rateLimit.retryAfterMinutes,
+      }
+    }
+
+    // ── Authenticate ────────────────────────────────────────────
+    const supabase = await createClient()
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+
+    if (error || !data.user) {
+      await recordLoginAttempt(email, ip, false, userAgent)
+      // Generic message prevents email enumeration
+      return { error: 'Invalid email or password. Please try again.' }
+    }
+
+    // ── Post-auth: clear rate limit, record success, audit ──────
+    await clearFailedAttempts(email)
+    await recordLoginAttempt(email, ip, true, userAgent)
+
+    const tenantId = data.user.app_metadata?.tenant_id as string | undefined
+    if (tenantId) {
+      const newDevice = await isNewDevice(data.user.id, ip)
+      await writeAuditLog({
+        tenantId,
+        userId: data.user.id,
+        action: 'login_success',
+        resource: 'auth',
+        ip,
+        userAgent,
+        metadata: { email, newDevice },
+      })
+    }
+
+    // ── Redirect ─────────────────────────────────────────────────
+    redirect('/dashboard')
+  } catch (err) {
+    // Re-throw redirect exceptions so Next.js handles them normally
+    if (err instanceof Error && err.message === 'NEXT_REDIRECT') throw err
+    // Surface unexpected errors in the form instead of crashing the page
+    const msg = process.env.NEXT_PUBLIC_DEBUG === 'true'
+      ? `Server error: ${err instanceof Error ? err.message : String(err)}`
+      : 'An unexpected error occurred. Please try again.'
+    return { error: msg }
   }
-
-  // ── Authenticate ────────────────────────────────────────────
-  const supabase = await createClient()
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-
-  if (error || !data.user) {
-    await recordLoginAttempt(email, ip, false, userAgent)
-
-    // Generic message prevents email enumeration
-    return { error: 'Invalid email or password. Please try again.' }
-  }
-
-  // ── Post-auth: clear rate limit, record success, audit ──────
-  await clearFailedAttempts(email)
-  await recordLoginAttempt(email, ip, true, userAgent)
-
-  const tenantId = data.user.app_metadata?.tenant_id as string | undefined
-  if (tenantId) {
-    const newDevice = await isNewDevice(data.user.id, ip)
-
-    await writeAuditLog({
-      tenantId,
-      userId: data.user.id,
-      action: 'login_success',
-      resource: 'auth',
-      ip,
-      userAgent,
-      metadata: { email, newDevice },
-    })
-
-    // TODO: If newDevice, send "suspicious login" email via Resend (Task 13)
-  }
-
-  // ── Redirect (TOTP check handled in middleware Part 2) ──────
-  redirect('/dashboard')
 }
 
 // ── Sign Up ───────────────────────────────────────────────────
@@ -164,81 +174,85 @@ export async function signUpAction(
   _prevState: AuthActionResult,
   formData: FormData
 ): Promise<AuthActionResult> {
-  const raw = {
-    fullName: formData.get('fullName') as string,
-    email: formData.get('email') as string,
-    password: formData.get('password') as string,
-    companyName: formData.get('companyName') as string,
-    termsAccepted: formData.get('termsAccepted') === 'on',
-  }
-
-  const parsed = signUpSchema.safeParse(raw)
-  if (!parsed.success) {
-    const firstError = parsed.error.errors[0]
-    return { error: firstError.message, field: String(firstError.path[0]) }
-  }
-
-  const { fullName, email, password, companyName } = parsed.data
-
-  // ── Create auth user ────────────────────────────────────────
-  const supabase = await createClient()
-  const { data: authData, error: authError } = await supabase.auth.signUp({
-    email,
-    password,
-    options: {
-      emailRedirectTo: `${appConfig.url}/api/auth/callback`,
-      data: { full_name: fullName }, // stored in auth.users.raw_user_meta_data
-    },
-  })
-
-  if (authError) {
-    if (authError.message.toLowerCase().includes('already registered')) {
-      return { error: 'An account with this email already exists. Try signing in.', field: 'email' }
+  try {
+    const raw = {
+      fullName: formData.get('fullName') as string,
+      email: formData.get('email') as string,
+      password: formData.get('password') as string,
+      companyName: formData.get('companyName') as string,
+      termsAccepted: formData.get('termsAccepted') === 'on',
     }
-    return { error: 'Failed to create account. Please try again.' }
+
+    const parsed = signUpSchema.safeParse(raw)
+    if (!parsed.success) {
+      const firstError = parsed.error.errors[0]
+      return { error: firstError.message, field: String(firstError.path[0]) }
+    }
+
+    const { fullName, email, password, companyName } = parsed.data
+
+    // ── Create auth user ────────────────────────────────────────
+    const supabase = await createClient()
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: `${appConfig.url}/api/auth/callback`,
+        data: { full_name: fullName },
+      },
+    })
+
+    if (authError) {
+      if (authError.message.toLowerCase().includes('already registered')) {
+        return { error: 'An account with this email already exists. Try signing in.', field: 'email' }
+      }
+      return { error: `Signup error: ${authError.message}` }
+    }
+
+    if (!authData.user) {
+      return { error: 'Failed to create account. Please try again.' }
+    }
+
+    // ── Create tenant + owner user row via DB function ──────────
+    const admin = await createAdminClient()
+    const baseSlug = generateSlug(companyName)
+
+    let slug = baseSlug
+    const { data: existingTenant } = await admin
+      .from('tenants')
+      .select('id')
+      .eq('slug', slug)
+      .maybeSingle()
+
+    if (existingTenant) {
+      slug = `${baseSlug}-${Date.now().toString(36)}`
+    }
+
+    const { data: tenantResult, error: tenantError } = await admin.rpc('create_tenant_with_owner', {
+      p_tenant_name: companyName,
+      p_tenant_slug: slug,
+      p_user_id: authData.user.id,
+      p_user_email: email,
+      p_user_name: fullName,
+    })
+
+    if (tenantError || !tenantResult) {
+      await admin.auth.admin.deleteUser(authData.user.id)
+      return { error: tenantError ? `DB error: ${tenantError.message}` : 'Failed to set up your account. Please try again.' }
+    }
+
+    if (authData.session) {
+      redirect('/onboarding')
+    }
+
+    redirect('/verify?email=' + encodeURIComponent(email))
+  } catch (err) {
+    if (err instanceof Error && err.message === 'NEXT_REDIRECT') throw err
+    const msg = process.env.NEXT_PUBLIC_DEBUG === 'true'
+      ? `Server error: ${err instanceof Error ? err.message : String(err)}`
+      : 'An unexpected error occurred. Please try again.'
+    return { error: msg }
   }
-
-  if (!authData.user) {
-    return { error: 'Failed to create account. Please try again.' }
-  }
-
-  // ── Create tenant + owner user row via DB function ──────────
-  const admin = await createAdminClient()
-  const baseSlug = generateSlug(companyName)
-
-  // Ensure slug uniqueness
-  let slug = baseSlug
-  const { data: existingTenant } = await admin
-    .from('tenants')
-    .select('id')
-    .eq('slug', slug)
-    .maybeSingle()
-
-  if (existingTenant) {
-    slug = `${baseSlug}-${Date.now().toString(36)}`
-  }
-
-  const { data: tenantResult, error: tenantError } = await admin.rpc('create_tenant_with_owner', {
-    p_tenant_name: companyName,
-    p_tenant_slug: slug,
-    p_user_id: authData.user.id,
-    p_user_email: email,
-    p_user_name: fullName,
-  })
-
-  if (tenantError || !tenantResult) {
-    // Rollback: delete the auth user to prevent orphaned accounts
-    await admin.auth.admin.deleteUser(authData.user.id)
-    return { error: 'Failed to set up your account. Please try again.' }
-  }
-
-  // ── If email confirmation disabled (dev), redirect to onboarding
-  if (authData.session) {
-    redirect('/onboarding')
-  }
-
-  // Otherwise, email confirmation is pending
-  redirect('/verify?email=' + encodeURIComponent(email))
 }
 
 // ── Sign Out ──────────────────────────────────────────────────
