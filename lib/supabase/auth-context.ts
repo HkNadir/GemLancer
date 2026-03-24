@@ -7,7 +7,7 @@
  * configured, or the user's session pre-dates when the hook was added.
  */
 
-import { createClient } from '@/lib/supabase/server'
+import { createClient, createAdminClient } from '@/lib/supabase/server'
 import type { User as SupabaseUser } from '@supabase/supabase-js'
 
 export interface AuthContext {
@@ -29,9 +29,10 @@ export async function getAuthContext(): Promise<AuthContext> {
   // Fast path: tenant_id is in the JWT (inject_tenant_claims hook is active)
   let tenantId = user.app_metadata?.tenant_id as string | undefined
 
-  // Slow path: hook not configured — look it up from the users table
+  // Slow path: hook not configured — use admin client to bypass RLS
   if (!tenantId) {
-    const { data: profile } = await supabase
+    const admin = await createAdminClient()
+    const { data: profile } = await admin
       .from('users')
       .select('tenant_id')
       .eq('id', user.id)
@@ -51,13 +52,14 @@ export async function getAuthContext(): Promise<AuthContext> {
  * Use this in actions that return { error } instead of throwing.
  */
 export async function resolveTenantId(
-  supabase: Awaited<ReturnType<typeof createClient>>,
+  _supabase: Awaited<ReturnType<typeof createClient>>,
   userId: string,
   jwtTenantId?: string
 ): Promise<string | null> {
   if (jwtTenantId) return jwtTenantId
 
-  const { data } = await supabase
+  const admin = createAdminClient()
+  const { data } = await admin
     .from('users')
     .select('tenant_id')
     .eq('id', userId)
